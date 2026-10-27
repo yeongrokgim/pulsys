@@ -588,11 +588,18 @@ func (h *Handler) tryServeFromCache(w http.ResponseWriter, rangeHdr, keyHex, ori
 		return h.serveCachedRedirect(w, meta)
 	}
 	// Resolve metadata (X-Repo-Commit, ...) to replay on a /_p/ body
-	// serve.  Post-fix entries already carry the merged set in their own
-	// ExtraHeaders; the supplement also heals entries written before
-	// this replay existed.  nil for non-/_p/ requests (originPath == "")
-	// and when no cached redirect is found.
-	originExtra := h.originResolveHeaders(originPath)
+	// serve.  Post-fix entries already carry the merged set in their
+	// own ExtraHeaders, so skip the redirect-meta lookup (a disk read on
+	// the hottest serve path) when the body entry is self-contained: a
+	// body entry can only carry X-Repo-Commit if the persist-time merge
+	// wrote the redirect's authoritative value there (CDNs never emit
+	// it).  Pre-fix entries lack it, fall through to the lookup, and
+	// are healed.  nil for non-/_p/ requests (originPath == "") and
+	// when no cached redirect is found.
+	var originExtra map[string]string
+	if originPath != "" && meta.ExtraHeaders["X-Repo-Commit"] == "" {
+		originExtra = h.originResolveHeaders(originPath)
+	}
 	// HEAD on a cached 200/206 body: answer with the metadata headers
 	// and an empty body.  We deliberately do NOT require Span coverage
 	// for HEAD -- the client wants to know the resource exists and its

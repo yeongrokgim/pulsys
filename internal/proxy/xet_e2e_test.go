@@ -147,7 +147,16 @@ func parseTestByteRange(rng string, n int) (start, end int, ok bool) {
 // http.Client can follow.
 func newXetProxyServer(tb testing.TB, fake upstream.Client) (*http.Client, string, func()) {
 	tb.Helper()
-	dir := tb.TempDir()
+	return newXetProxyServerAt(tb, fake, filepath.Join(tb.TempDir(), "cache"))
+}
+
+// newXetProxyServerAt is newXetProxyServer over an explicit cache dir.
+// A test can stop the returned server, inspect or mutate the on-disk
+// cache, and build a fresh proxy over the same dir -- the restart gives
+// the new Store an in-memory snapshot built from disk only, so entries
+// deleted between the two servers are genuinely gone.
+func newXetProxyServerAt(tb testing.TB, fake upstream.Client, cacheDir string) (*http.Client, string, func()) {
+	tb.Helper()
 	// We need the public base URL to point at the eventual server URL.
 	// httptest.NewUnstartedServer lets us pin the listener first, look at
 	// its addr, then construct the cfg with that PublicBaseURL.
@@ -157,7 +166,7 @@ func newXetProxyServer(tb testing.TB, fake upstream.Client) (*http.Client, strin
 	cfg, err := config.ParseFlags(flag.NewFlagSet("xet", flag.ContinueOnError), []string{
 		"-listen", "127.0.0.1:0",
 		"-admin-listen", "127.0.0.1:0",
-		"-cache-dir", filepath.Join(dir, "cache"),
+		"-cache-dir", cacheDir,
 		"-public-base-url", publicURL,
 	})
 	if err != nil {
@@ -532,6 +541,136 @@ func TestHeadResolveMetadataFlowReplaysHeaders(t *testing.T) {
 	if cas := fake.casCount.Load(); cas != 2 {
 		t.Fatalf("expected exactly 2 cas-bridge upstream fetches, got %d", cas)
 	}
+}
+
+// TestPBodyWarmServeSurvivesRedirectMetaEviction pins the contract that
+// makes the warm /_p/ short-circuit safe: a body entry written since
+// the hub 2.x fix carries the origin resolve's preserved headers in its
+// OWN ExtraHeaders (merged at persist time by streamCacheable200/206),
+// so a warm serve must not depend on the cached redirect still being
+// present.
+//
+// The scenario is real-world: cache dirs outlive processes, and the
+// tiny redirect metas are the cheapest entries to lose (purge, manual
+// cleanup, partial restore).  A warm /_p/ serve after the redirect
+// entry is gone must still replay X-Repo-Commit / X-Linked-Etag /
+// X-Linked-Size -- hub 2.x aborts the download otherwise.  The proxy is
+// RESTARTED over the same cache dir so the deletion cannot be masked by
+// the Store's in-memory snapshot.
+func TestPBodyWarmServeSurvivesRedirectMetaEviction(t *testing.T) {
+	const sha = "d3fa1a30fd06e248bc8ac73c4adb34a63d4114a8ee2753547c358e8a37cde8758"
+	const commit = "2b7c9e0f83dfa663caf39e06633721c8d4cfcd7a"
+	body := bytes.Repeat([]byte("e"), 96*1024)
+	fake := &xetUpstream{body: body, hash: sha, commit: commit}
+	cacheDir := filepath.Join(t.TempDir(), "cache")
+
+	client, base, stop := newXetProxyServerAt(t, fake, cacheDir)
+
+	assertMeta := func(tb testing.TB, hdr http.Header, where string) {
+		tb.Helper()
+		if got := hdr.Get("X-Repo-Commit"); got != commit {
+			tb.Fatalf("%s: X-Repo-Commit=%q, want %q", where, got, commit)
+		}
+		if got := hdr.Get("X-Linked-Size"); got != strconv.Itoa(len(body)) {
+			tb.Fatalf("%s: X-Linked-Size=%q, want %d", where, got, len(body))
+		}
+		if hdr.Get("X-Linked-Etag") == "" {
+			tb.Fatalf("%s: missing X-Linked-Etag", where)
+		}
+	}
+
+	// (1) Cold resolve -> 302, then cold /_p/ body -> 200 with metadata.
+	resp, err := client.Get(base + "/Qwen/Qwen2.5-0.5B-Instruct/resolve/main/model.safetensors")
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("resolve: expected 302, got %d", resp.StatusCode)
+	}
+	loc := resp.Header.Get("Location")
+	bodyResp, err := client.Get(loc)
+	if err != nil {
+		t.Fatalf("cold /_p/ body: %v", err)
+	}
+	got, _ := io.ReadAll(bodyResp.Body)
+	_ = bodyResp.Body.Close()
+	if bodyResp.StatusCode != http.StatusOK || !bytes.Equal(got, body) {
+		t.Fatalf("cold /_p/ body: status %d, %d bytes", bodyResp.StatusCode, len(got))
+	}
+	assertMeta(t, bodyResp.Header, "cold /_p/ body")
+
+	// Restart the proxy over the same cache dir with every cached
+	// REDIRECT entry deleted: warm serves must be self-contained.
+	stop()
+	removed := removeCachedRedirects(t, cacheDir)
+	if removed == 0 {
+		t.Fatal("expected at least one cached redirect meta to remove")
+	}
+	client2, base2, stop2 := newXetProxyServerAt(t, fake, cacheDir)
+	defer stop2()
+
+	warmURL := base2 + strings.TrimPrefix(loc, base) // /_p/<host>/<path>?<presign+origin>
+
+	// (2) Warm /_p/ GET after eviction: metadata must come from the
+	// body entry's own ExtraHeaders.
+	warm, err := client2.Get(warmURL)
+	if err != nil {
+		t.Fatalf("warm /_p/ GET: %v", err)
+	}
+	got2, _ := io.ReadAll(warm.Body)
+	_ = warm.Body.Close()
+	if warm.StatusCode != http.StatusOK || !bytes.Equal(got2, body) {
+		t.Fatalf("warm /_p/ GET: status %d, %d bytes", warm.StatusCode, len(got2))
+	}
+	assertMeta(t, warm.Header, "warm /_p/ GET after redirect eviction")
+
+	// (3) Warm /_p/ HEAD after eviction.
+	headResp, err := client2.Head(warmURL)
+	if err != nil {
+		t.Fatalf("warm /_p/ HEAD: %v", err)
+	}
+	_ = headResp.Body.Close()
+	if headResp.StatusCode != http.StatusOK {
+		t.Fatalf("warm /_p/ HEAD: expected 200, got %d", headResp.StatusCode)
+	}
+	assertMeta(t, headResp.Header, "warm /_p/ HEAD after redirect eviction")
+
+	// No upstream refetch: one resolve, one body fetch, total.
+	if res := fake.resolveCount.Load(); res != 1 {
+		t.Fatalf("expected exactly 1 huggingface.co upstream fetch, got %d", res)
+	}
+	if cas := fake.casCount.Load(); cas != 1 {
+		t.Fatalf("expected exactly 1 cas-bridge upstream fetch, got %d", cas)
+	}
+}
+
+// removeCachedRedirects deletes the meta.json of every cached 30x
+// redirect entry under cacheDir, returning how many were removed.  Body
+// entries (200/206) are left in place.
+func removeCachedRedirects(tb testing.TB, cacheDir string) int {
+	tb.Helper()
+	removed := 0
+	_ = filepath.WalkDir(cacheDir, func(path string, d os.DirEntry, err error) error {
+		if err != nil || d.IsDir() || d.Name() != "meta.json" {
+			return nil
+		}
+		b, err := os.ReadFile(path)
+		if err != nil {
+			return nil
+		}
+		var meta cache.Meta
+		if json.Unmarshal(b, &meta) != nil {
+			return nil
+		}
+		if cache.IsCacheableRedirectStatus(meta.StatusCode) {
+			if os.Remove(path) == nil {
+				removed++
+			}
+		}
+		return nil
+	})
+	return removed
 }
 
 // TestXetCasBridgeCacheIgnoresAuthorizationHeader pins the production-
