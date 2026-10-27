@@ -153,6 +153,36 @@ func mergePreservedHeaders(own, authoritative map[string]string) map[string]stri
 	return out
 }
 
+// normalizedKeyQuery applies the query component rule of the cache key:
+// the query is part of the key for huggingface.co (the API takes
+// meaningful query params on tree / paths-info) but is stripped on
+// content-addressed hosts (cas-bridge / LFS CDN), where it is a
+// rotating AWS presigned signature -- two redirects to the same file
+// body would otherwise land in different slots.
+func normalizedKeyQuery(host, rawQuery string) string {
+	if cache.IsContentAddressedHost(host) {
+		return ""
+	}
+	return rawQuery
+}
+
+// cacheKey applies the standard key normalisation and returns the hex
+// cache key for a request: query per normalizedKeyQuery, and auth is
+// NEVER part of the key (a single user runs the same proxy across many
+// clients and credential contexts; letting auth into the key fragments
+// the cache -- see the full rationale in ServeHTTP).
+//
+// Every key computation in this package MUST go through here so the
+// lookup side and the store side can never drift.  In particular the
+// HEAD lookup in ServeHTTP, the HEAD-filed redirect store in forward,
+// the rev-alias key in maybeWriteRevAlias, and the origin-redirect
+// lookup in originResolveHeaders all derive their keys from this one
+// rule.
+func (h *Handler) cacheKey(method, host, path, rawQuery string) string {
+	const keyAuth = ""
+	return h.keyHexC.Get(method, host, path, normalizedKeyQuery(host, rawQuery), keyAuth)
+}
+
 // originResolveHeaders returns the preserved response headers
 // (X-Repo-Commit, X-Linked-Etag, X-Linked-Size, X-Xet-Hash, ...) of the
 // cached redirect that sent the client to a /_p/ body URL, or nil.
@@ -181,8 +211,7 @@ func (h *Handler) originResolveHeaders(originPath string) map[string]string {
 		return nil
 	}
 	host := strings.ToLower(strings.TrimSpace(h.cfg.DefaultHost))
-	const keyAuth = ""
-	key := h.keyHexC.Get(http.MethodGet, host, originPath, "", keyAuth)
+	key := h.cacheKey(http.MethodGet, host, originPath, "")
 	meta, err := h.store.LoadMeta(key)
 	if err != nil || meta == nil {
 		return nil
@@ -238,16 +267,10 @@ func (h *Handler) maybeWriteRevAlias(method, upstreamHost, path, rawQuery, auth,
 	if !ok || aliasPath == path {
 		return
 	}
-	// Same key-normalisation rules as the request path: query stripped
-	// on content-addressed hosts, auth always stripped.  (See ServeHTTP
-	// for the rationale.)
+	// Same key-normalisation rules as the request path, via cacheKey.
+	// (See ServeHTTP for the rationale.)
 	_ = auth
-	keyQuery := rawQuery
-	if cache.IsContentAddressedHost(upstreamHost) {
-		keyQuery = ""
-	}
-	const keyAuth = ""
-	aliasKey := h.keyHexC.Get(method, upstreamHost, aliasPath, keyQuery, keyAuth)
+	aliasKey := h.cacheKey(method, upstreamHost, aliasPath, rawQuery)
 	if aliasKey == canonicalKey {
 		return
 	}
@@ -379,12 +402,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	//    addressed hosts (cas-bridge / LFS CDN) we strip the query
 	//    because it's a rotating AWS presigned signature; two redirects
 	//    to the same file body otherwise land in different slots.
-	keyQuery := rawQuery
-	if cache.IsContentAddressedHost(upstreamHost) {
-		keyQuery = ""
-	}
-	const keyAuth = ""
-	keyHex := h.keyHexC.Get(method, upstreamHost, path, keyQuery, keyAuth)
+	//
+	// Both rules are implemented once in cacheKey / normalizedKeyQuery;
+	// every key computation in this package goes through them so the
+	// lookup side and the store side can never drift.
+	keyHex := h.cacheKey(method, upstreamHost, path, rawQuery)
 
 	// HEAD requests are read-only metadata.  We treat them as aliases
 	// of GET on the same path for both classification (artifact bit)
@@ -408,6 +430,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// are visible to grep instead of inferable from miss-counter arithmetic.
 	// Auth is logged as a length-and-prefix tag (never the raw token).
 	if h.log.Enabled(r.Context(), slog.LevelDebug) {
+		keyQuery := normalizedKeyQuery(upstreamHost, rawQuery)
 		h.log.Debug("cache-key",
 			"method", method,
 			"host", upstreamHost,
@@ -433,13 +456,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if (method == http.MethodGet || isHead) && (artifact || h.cfg.Offline) {
 		lookupKey := keyHex
 		if isHead {
-			// HEAD looks up under the GET method, but with the same
-			// key-normalisation we just did on the request key:
-			// keyAuth is always "", keyQuery is "" only on
-			// content-addressed hosts.  This is what lets HEAD on
+			// HEAD looks up under the GET method, with the same key
+			// normalisation (cacheKey).  This is what lets HEAD on
 			// /resolve/<sha>/<file> find the alias entry written by
 			// the cold GET on /resolve/main/<file>.
-			lookupKey = h.keyHexC.Get(http.MethodGet, upstreamHost, path, keyQuery, keyAuth)
+			lookupKey = h.cacheKey(http.MethodGet, upstreamHost, path, rawQuery)
 		}
 		if h.tryServeFromCache(w, rangeHdr, lookupKey, originPath, isHead) {
 			return
@@ -883,12 +904,10 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamHost, 
 	if (meth == http.MethodGet || meth == http.MethodHead) && cache.IsCacheableRedirectStatus(resp.Status) {
 		storeKey := keyHex
 		if meth == http.MethodHead {
-			keyQuery := rawQuery
-			if cache.IsContentAddressedHost(upstreamHost) {
-				keyQuery = ""
-			}
-			const keyAuth = ""
-			storeKey = h.keyHexC.Get(http.MethodGet, upstreamHost, path, keyQuery, keyAuth)
+			// Filed under the GET key via cacheKey -- the exact key a
+			// HEAD lookup in ServeHTTP recomputes, and the one the
+			// /_p/ follow's originResolveHeaders reads.
+			storeKey = h.cacheKey(http.MethodGet, upstreamHost, path, rawQuery)
 		}
 		h.cacheRedirect(cctx, w, resp, storeKey, upstreamHost, path, rawQuery, auth, hdr)
 		if unlock != nil {
