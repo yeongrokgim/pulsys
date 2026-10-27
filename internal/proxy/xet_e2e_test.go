@@ -49,14 +49,19 @@ import (
 //     presign) so a second cold redirect with a different signature
 //     warm-hits.
 type xetUpstream struct {
-	body         []byte
-	hash         string
+	body []byte
+	hash string
+	// commit, when set, makes the resolve 302 carry the resolve
+	// metadata real HF emits (X-Repo-Commit, X-Linked-Etag,
+	// X-Linked-Size) -- what huggingface_hub reads to identify the
+	// artifact.
+	commit       string
 	resolveCount atomic.Int64 // calls to /resolve/main/...
 	casCount     atomic.Int64 // calls to cas-bridge bytes path
 	presignNonce atomic.Int64 // monotonic counter to vary the presign each call
 }
 
-func (u *xetUpstream) Do(_ context.Context, _, host, path, _ string, _ http.Header, _ []byte) (*upstream.Response, error) {
+func (u *xetUpstream) Do(_ context.Context, _, host, path, _ string, reqHdr http.Header, _ []byte) (*upstream.Response, error) {
 	switch host {
 	case "huggingface.co", "hf.co":
 		u.resolveCount.Add(1)
@@ -68,6 +73,11 @@ func (u *xetUpstream) Do(_ context.Context, _, host, path, _ string, _ http.Head
 		h := http.Header{}
 		h.Set("Location", loc)
 		h.Set("X-Xet-Hash", u.hash)
+		if u.commit != "" {
+			h.Set("X-Repo-Commit", u.commit)
+			h.Set("X-Linked-Etag", `"`+u.hash+`"`)
+			h.Set("X-Linked-Size", strconv.Itoa(len(u.body)))
+		}
 		h.Set("Link",
 			`<https://huggingface.co/api/models/x/y/xet-read-token/abc>; rel="xet-auth", `+
 				`<https://cas-server.xethub.hf.co/v1/reconstructions/`+u.hash+`>; rel="xet-reconstruction-info"`)
@@ -81,8 +91,21 @@ func (u *xetUpstream) Do(_ context.Context, _, host, path, _ string, _ http.Head
 		u.casCount.Add(1)
 		h := http.Header{}
 		h.Set("Content-Type", "application/octet-stream")
-		h.Set("Content-Length", strconv.Itoa(len(u.body)))
 		h.Set("ETag", `"`+u.hash+`"`)
+		// Single-range support so the 206 code paths (parallel chunk
+		// downloads) are exercisable end to end.
+		if start, end, ok := parseTestByteRange(reqHdr.Get("Range"), len(u.body)); ok {
+			chunk := u.body[start:end]
+			h.Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end-1, len(u.body)))
+			h.Set("Content-Length", strconv.Itoa(len(chunk)))
+			return &upstream.Response{
+				Status:        http.StatusPartialContent,
+				Header:        h,
+				ContentLength: int64(len(chunk)),
+				Body:          io.NopCloser(bytes.NewReader(chunk)),
+			}, nil
+		}
+		h.Set("Content-Length", strconv.Itoa(len(u.body)))
 		return &upstream.Response{
 			Status:        http.StatusOK,
 			Header:        h,
@@ -91,6 +114,31 @@ func (u *xetUpstream) Do(_ context.Context, _, host, path, _ string, _ http.Head
 		}, nil
 	}
 	return nil, errors.New("xetUpstream: unexpected host " + host)
+}
+
+// parseTestByteRange parses a single "bytes=a-b" Range against a body
+// of length n.  end is exclusive.
+func parseTestByteRange(rng string, n int) (start, end int, ok bool) {
+	rest, found := strings.CutPrefix(rng, "bytes=")
+	if !found {
+		return 0, 0, false
+	}
+	a, b, found := strings.Cut(rest, "-")
+	if !found {
+		return 0, 0, false
+	}
+	start, err := strconv.Atoi(a)
+	if err != nil || start < 0 || start >= n {
+		return 0, 0, false
+	}
+	end, err = strconv.Atoi(b)
+	if err != nil {
+		return 0, 0, false
+	}
+	if end < start || end >= n {
+		end = n
+	}
+	return start, end + 1, true
 }
 
 // newXetProxyServer wires a real proxy.Handler over httptest.NewServer.
@@ -225,6 +273,264 @@ func TestXetRedirectStripsXetLinksAndCachesByContentHash(t *testing.T) {
 	if cas := fake.casCount.Load(); cas != 1 {
 		t.Fatalf("HARD: warm Xet hit should pull ZERO new bytes from cas-bridge; "+
 			"casCount went 1 -> %d", cas)
+	}
+}
+
+// TestResolveMetadataReplayedOnPBodyResponses pins compatibility with
+// huggingface_hub >= 0.34 (the 2.x line, incl. the `hf` CLI): the client
+// follows the whole /resolve/ -> 302 -> CDN chain within ONE request and
+// validates the resolve metadata (X-Repo-Commit, X-Linked-Etag,
+// X-Linked-Size) on the FINAL body response.  Pulsys rewrites the CDN
+// Location to /_p/<cdn-host>/... and serves the body itself, but the CDN
+// response does not carry that metadata -- without replaying the cached
+// redirect's preserved headers on the /_p/ response, `hf download`
+// aborts with:
+//
+//	Error: Local entry not found. Response from .../resolve/<sha>/<file>
+//	is missing the 'X-Repo-Commit' header, so it does not seem to be
+//	served by a Hugging Face Hub endpoint.
+//
+// The metadata must be present on the /_p/ body response COLD (fetched
+// from the CDN), WARM (replayed from the body cache), on ranged 206
+// serves, and through the SHA-pinned /resolve/<sha>/<file> rev alias.
+func TestResolveMetadataReplayedOnPBodyResponses(t *testing.T) {
+	const sha = "bb5ff7e71536bbce6378f6d4bb523a77f1e9455965702d18bec33f599d5851f7"
+	const commit = "7ae557604adf67be50417f59c2c2f167def9a775"
+	body := bytes.Repeat([]byte("m"), 128*1024)
+	fake := &xetUpstream{body: body, hash: sha, commit: commit}
+	client, base, stop := newXetProxyServer(t, fake)
+	defer stop()
+
+	const repo = "/Qwen/Qwen2.5-0.5B-Instruct"
+	resolveURL := base + repo + "/resolve/main/model.safetensors"
+
+	assertMeta := func(tb testing.TB, hdr http.Header, where string) {
+		tb.Helper()
+		if got := hdr.Get("X-Repo-Commit"); got != commit {
+			tb.Fatalf("%s: X-Repo-Commit=%q, want %q", where, got, commit)
+		}
+		if got := hdr.Get("X-Linked-Size"); got != strconv.Itoa(len(body)) {
+			tb.Fatalf("%s: X-Linked-Size=%q, want %d", where, got, len(body))
+		}
+		if hdr.Get("X-Linked-Etag") == "" {
+			tb.Fatalf("%s: missing X-Linked-Etag", where)
+		}
+	}
+
+	// (1) Cold resolve -> 302.  The redirect itself must carry the
+	// metadata (hub 1.x reads it here).
+	resp1, err := client.Get(resolveURL)
+	if err != nil {
+		t.Fatalf("resolve #1: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusFound {
+		t.Fatalf("resolve #1: expected 302, got %d", resp1.StatusCode)
+	}
+	assertMeta(t, resp1.Header, "cold resolve 302")
+	loc := resp1.Header.Get("Location")
+	if loc == "" {
+		t.Fatal("resolve #1: missing Location")
+	}
+
+	// (2) COLD /_p/ body: hub 2.x reads the metadata off THIS response.
+	bodyResp, err := client.Get(loc)
+	if err != nil {
+		t.Fatalf("cold /_p/ body: %v", err)
+	}
+	got1, _ := io.ReadAll(bodyResp.Body)
+	_ = bodyResp.Body.Close()
+	if bodyResp.StatusCode != http.StatusOK {
+		t.Fatalf("cold /_p/ body: expected 200, got %d", bodyResp.StatusCode)
+	}
+	if !bytes.Equal(got1, body) {
+		t.Fatal("cold /_p/ body: body mismatch")
+	}
+	assertMeta(t, bodyResp.Header, "cold /_p/ body")
+
+	// (3) WARM resolve -> cached 302 replay with metadata.
+	resp2, err := client.Get(resolveURL)
+	if err != nil {
+		t.Fatalf("resolve #2: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusFound {
+		t.Fatalf("resolve #2: expected 302, got %d", resp2.StatusCode)
+	}
+	assertMeta(t, resp2.Header, "warm resolve 302")
+
+	// (4) WARM /_p/ body: replayed from the body cache with metadata.
+	bodyResp2, err := client.Get(resp2.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("warm /_p/ body: %v", err)
+	}
+	got2, _ := io.ReadAll(bodyResp2.Body)
+	_ = bodyResp2.Body.Close()
+	if bodyResp2.StatusCode != http.StatusOK {
+		t.Fatalf("warm /_p/ body: expected 200, got %d", bodyResp2.StatusCode)
+	}
+	if !bytes.Equal(got2, body) {
+		t.Fatal("warm /_p/ body: body mismatch")
+	}
+	assertMeta(t, bodyResp2.Header, "warm /_p/ body")
+
+	// (5) Ranged warm /_p/ request -> 206 from cache with metadata
+	// (parallel chunk downloads take this path).
+	reqRange, err := http.NewRequest(http.MethodGet, loc, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reqRange.Header.Set("Range", "bytes=0-1023")
+	respRange, err := client.Do(reqRange)
+	if err != nil {
+		t.Fatalf("ranged /_p/: %v", err)
+	}
+	chunk, _ := io.ReadAll(respRange.Body)
+	_ = respRange.Body.Close()
+	if respRange.StatusCode != http.StatusPartialContent {
+		t.Fatalf("ranged /_p/: expected 206, got %d", respRange.StatusCode)
+	}
+	if !bytes.Equal(chunk, body[:1024]) {
+		t.Fatal("ranged /_p/: chunk mismatch")
+	}
+	assertMeta(t, respRange.Header, "warm ranged /_p/ 206")
+
+	// (6) SHA-pinned resolve (hub 2.x requests /resolve/<sha>/<file>):
+	// the rev alias replays the cached redirect, and the /_p/ warm
+	// serve finds the redirect metadata through the alias hop.
+	respSha, err := client.Get(base + repo + "/resolve/" + commit + "/model.safetensors")
+	if err != nil {
+		t.Fatalf("sha resolve: %v", err)
+	}
+	_ = respSha.Body.Close()
+	if respSha.StatusCode != http.StatusFound {
+		t.Fatalf("sha resolve: expected 302, got %d", respSha.StatusCode)
+	}
+	assertMeta(t, respSha.Header, "sha resolve 302 (rev alias)")
+	bodyResp3, err := client.Get(respSha.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("sha /_p/ body: %v", err)
+	}
+	got3, _ := io.ReadAll(bodyResp3.Body)
+	_ = bodyResp3.Body.Close()
+	if bodyResp3.StatusCode != http.StatusOK {
+		t.Fatalf("sha /_p/ body: expected 200, got %d", bodyResp3.StatusCode)
+	}
+	if !bytes.Equal(got3, body) {
+		t.Fatal("sha /_p/ body: body mismatch")
+	}
+	assertMeta(t, bodyResp3.Header, "sha /_p/ warm body (alias hop)")
+
+	// Everything after the first cold resolve must have been served
+	// from cache: one resolve, one cas-bridge fetch, total.
+	if cas := fake.casCount.Load(); cas != 1 {
+		t.Fatalf("expected exactly 1 cas-bridge upstream fetch, got %d", cas)
+	}
+	if res := fake.resolveCount.Load(); res != 1 {
+		t.Fatalf("expected exactly 1 huggingface.co upstream fetch, got %d", res)
+	}
+}
+
+// TestHeadResolveMetadataFlowReplaysHeaders pins the hub 2.x HEAD
+// metadata flow: hub issues HEAD /resolve/<rev>/<file> and follows the
+// redirect chain in one request, reading the resolve metadata off the
+// FINAL /_p/ response.  HEAD 30x responses must therefore be cached
+// under the GET key (HEAD lookups already alias to GET keys), or the
+// /_p/ HEAD follow finds no cached redirect and the response lacks
+// X-Repo-Commit -- the cold-cache `hf download` failure:
+//
+//	Error: Local entry not found. Response from .../resolve/<sha>/<file>
+//	is missing the 'X-Repo-Commit' header ...
+func TestHeadResolveMetadataFlowReplaysHeaders(t *testing.T) {
+	const sha = "63bed80836ee0758c8fd4f8975d59bb0b864263ee2753547c358e8a37cde8758"
+	const commit = "607a30d783dfa663caf39e06633721c8d4cfcd7e"
+	body := bytes.Repeat([]byte("h"), 64*1024)
+	fake := &xetUpstream{body: body, hash: sha, commit: commit}
+	client, base, stop := newXetProxyServer(t, fake)
+	defer stop()
+
+	resolveURL := base + "/openai-community/gpt2/resolve/main/model.safetensors"
+
+	assertMeta := func(tb testing.TB, hdr http.Header, where string) {
+		tb.Helper()
+		if got := hdr.Get("X-Repo-Commit"); got != commit {
+			tb.Fatalf("%s: X-Repo-Commit=%q, want %q", where, got, commit)
+		}
+		if got := hdr.Get("X-Linked-Size"); got != strconv.Itoa(len(body)) {
+			tb.Fatalf("%s: X-Linked-Size=%q, want %d", where, got, len(body))
+		}
+		if hdr.Get("X-Linked-Etag") == "" {
+			tb.Fatalf("%s: missing X-Linked-Etag", where)
+		}
+	}
+
+	// (1) HEAD resolve -> 302 carrying the metadata.
+	headReq, err := http.NewRequest(http.MethodHead, resolveURL, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp1, err := client.Do(headReq)
+	if err != nil {
+		t.Fatalf("HEAD resolve: %v", err)
+	}
+	_ = resp1.Body.Close()
+	if resp1.StatusCode != http.StatusFound {
+		t.Fatalf("HEAD resolve: expected 302, got %d", resp1.StatusCode)
+	}
+	assertMeta(t, resp1.Header, "HEAD resolve 302")
+	loc := resp1.Header.Get("Location")
+	if loc == "" {
+		t.Fatal("HEAD resolve: missing Location")
+	}
+
+	// (2) HEAD follow of the /_p/ Location -> 200 carrying the
+	// metadata.  This is the exact request hub 2.x aborts on when the
+	// HEAD-observed redirect is not cached.
+	resp2, err := client.Head(loc)
+	if err != nil {
+		t.Fatalf("HEAD /_p/ follow: %v", err)
+	}
+	_ = resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("HEAD /_p/ follow: expected 200, got %d", resp2.StatusCode)
+	}
+	assertMeta(t, resp2.Header, "HEAD /_p/ follow")
+
+	// (3) A subsequent GET resolve warm-hits the redirect the HEAD
+	// cached (filed under the GET key): no new upstream resolve.
+	resp3, err := client.Get(resolveURL)
+	if err != nil {
+		t.Fatalf("GET resolve: %v", err)
+	}
+	_ = resp3.Body.Close()
+	if resp3.StatusCode != http.StatusFound {
+		t.Fatalf("GET resolve: expected 302, got %d", resp3.StatusCode)
+	}
+	assertMeta(t, resp3.Header, "GET resolve 302 (HEAD-cached redirect)")
+
+	// (4) GET /_p/ body fetch -> 200 with metadata.
+	resp4, err := client.Get(resp3.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("GET /_p/ body: %v", err)
+	}
+	got, _ := io.ReadAll(resp4.Body)
+	_ = resp4.Body.Close()
+	if resp4.StatusCode != http.StatusOK {
+		t.Fatalf("GET /_p/ body: expected 200, got %d", resp4.StatusCode)
+	}
+	if !bytes.Equal(got, body) {
+		t.Fatal("GET /_p/ body: body mismatch")
+	}
+	assertMeta(t, resp4.Header, "GET /_p/ body")
+
+	// One upstream resolve (the HEAD) and two upstream body fetches:
+	// the HEAD /_p/ follow (HEADs are never teed to disk) plus the
+	// cold GET /_p/ body fetch.
+	if res := fake.resolveCount.Load(); res != 1 {
+		t.Fatalf("expected exactly 1 huggingface.co upstream fetch, got %d", res)
+	}
+	if cas := fake.casCount.Load(); cas != 2 {
+		t.Fatalf("expected exactly 2 cas-bridge upstream fetches, got %d", cas)
 	}
 }
 

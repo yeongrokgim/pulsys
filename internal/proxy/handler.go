@@ -128,6 +128,73 @@ func applyExtraHeaders(dst http.Header, extra map[string]string) {
 	}
 }
 
+// mergePreservedHeaders merges a fallback header set (the origin
+// resolve redirect's preserved headers) into a body response's own
+// preserved set.  Values already present in `own` win: they came from
+// the host that actually served the body.
+func mergePreservedHeaders(own, fallback map[string]string) map[string]string {
+	if len(fallback) == 0 {
+		return own
+	}
+	out := make(map[string]string, len(own)+len(fallback))
+	for k, v := range fallback {
+		if v != "" {
+			out[k] = v
+		}
+	}
+	for k, v := range own {
+		out[k] = v
+	}
+	return out
+}
+
+// originResolveHeaders returns the preserved response headers
+// (X-Repo-Commit, X-Linked-Etag, X-Linked-Size, X-Xet-Hash, ...) of the
+// cached redirect that sent the client to a /_p/ body URL, or nil.
+//
+// huggingface_hub reads resolve metadata (commit hash, LFS etag/size)
+// from the FIRST /resolve/ response -- the 30x that carries Location.
+// hub 2.x (huggingface_hub >= 0.34, incl. the `hf` CLI) instead follows
+// the whole redirect chain within a single request and validates these
+// headers on the FINAL body response, aborting with
+// LocalEntryNotFoundError ("missing the 'X-Repo-Commit' header") when
+// they are absent.  Pulsys rewrites the CDN Location to
+// /_p/<cdn-host>/... and serves the body itself, but the CDN's response
+// does not carry the resolve metadata -- only the cached redirect does.
+//
+// The redirect is filed under the cache key of the originating resolve
+// request (method GET, default host, no auth; cacheRedirect persists
+// its preserved headers via pickPreservedHeaders).  hub clients issue
+// resolve requests without a query string, so the query component of
+// the key is ""; a resolve that carried query params simply misses here
+// and callers behave exactly as before.  A SHA-pinned
+// /resolve/<sha>/<file> key may instead be an alias written by
+// maybeWriteRevAlias pointing at the /resolve/main/<file> canonical
+// slot, so we follow AliasOf one hop.
+func (h *Handler) originResolveHeaders(originPath string) map[string]string {
+	if originPath == "" {
+		return nil
+	}
+	host := strings.ToLower(strings.TrimSpace(h.cfg.DefaultHost))
+	const keyAuth = ""
+	key := h.keyHexC.Get(http.MethodGet, host, originPath, "", keyAuth)
+	meta, err := h.store.LoadMeta(key)
+	if err != nil || meta == nil {
+		return nil
+	}
+	if meta.AliasOf != "" {
+		canonical, err := h.store.LoadMeta(meta.AliasOf)
+		if err != nil || canonical == nil {
+			return nil
+		}
+		meta = canonical
+	}
+	if !cache.IsCacheableRedirectStatus(meta.StatusCode) {
+		return nil
+	}
+	return meta.ExtraHeaders
+}
+
 // resolveRevParts splits a /<org>/<repo>/resolve/<rev>/<file> path into
 // its components, returning the path with <rev> replaced by the
 // argument.  If `path` doesn't match the resolve pattern, ok is false.
@@ -369,7 +436,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			// the cold GET on /resolve/main/<file>.
 			lookupKey = h.keyHexC.Get(http.MethodGet, upstreamHost, path, keyQuery, keyAuth)
 		}
-		if h.tryServeFromCache(w, rangeHdr, lookupKey, isHead) {
+		if h.tryServeFromCache(w, rangeHdr, lookupKey, originPath, isHead) {
 			return
 		}
 	}
@@ -459,7 +526,7 @@ func (h *Handler) routeUpstream(w http.ResponseWriter, path string) (host string
 // sendfile + sf_hdtr syscall on Darwin.  coreserver runs in front of
 // this handler and only falls through to ServeHTTP when it cannot
 // take over.)
-func (h *Handler) tryServeFromCache(w http.ResponseWriter, rangeHdr, keyHex string, headOnly bool) bool {
+func (h *Handler) tryServeFromCache(w http.ResponseWriter, rangeHdr, keyHex, originPath string, headOnly bool) bool {
 	meta, err := h.store.LoadMeta(keyHex)
 	if err != nil || meta == nil {
 		telemetry.IncCacheMiss()
@@ -494,13 +561,19 @@ func (h *Handler) tryServeFromCache(w http.ResponseWriter, rangeHdr, keyHex stri
 	if cache.IsCacheableRedirectStatus(meta.StatusCode) && meta.Location != "" {
 		return h.serveCachedRedirect(w, meta)
 	}
+	// Resolve metadata (X-Repo-Commit, ...) to replay on a /_p/ body
+	// serve.  Post-fix entries already carry the merged set in their own
+	// ExtraHeaders; the supplement also heals entries written before
+	// this replay existed.  nil for non-/_p/ requests (originPath == "")
+	// and when no cached redirect is found.
+	originExtra := h.originResolveHeaders(originPath)
 	// HEAD on a cached 200/206 body: answer with the metadata headers
 	// and an empty body.  We deliberately do NOT require Span coverage
 	// for HEAD -- the client wants to know the resource exists and its
 	// total size, which meta carries even when our body cache is
 	// partial.
 	if headOnly {
-		return h.serveCachedHead(w, meta)
+		return h.serveCachedHead(w, meta, originExtra)
 	}
 	if len(meta.Spans) == 0 {
 		telemetry.IncCacheMiss()
@@ -547,6 +620,9 @@ func (h *Handler) tryServeFromCache(w http.ResponseWriter, rangeHdr, keyHex stri
 		hdr.Set("ETag", meta.ETag)
 	}
 	applyExtraHeaders(hdr, meta.ExtraHeaders)
+	// Origin resolve headers win over the body entry's own copy (they
+	// are the authoritative resolve metadata; identical post-fix).
+	applyExtraHeaders(hdr, originExtra)
 	hdr.Set("Content-Length", strconv.FormatInt(n, 10))
 	if rangeHdr != "" {
 		hdr.Set("Content-Range", formatContentRange(wantStart, wantEnd, total))
@@ -567,13 +643,16 @@ func (h *Handler) tryServeFromCache(w http.ResponseWriter, rangeHdr, keyHex stri
 // Without this alias every such HEAD 504s in offline mode -- we only
 // ever wrote the GET response under the GET key.
 //
+// originExtra carries the origin resolve's preserved headers for /_p/
+// HEADs; see originResolveHeaders.
+//
 // Coverage is intentionally NOT checked: HEAD describes the full
 // resource, and meta.Total carries the authoritative size even when
 // our body cache holds only a partial range.  Range headers on HEAD
 // are ignored for the same reason (HEAD+Range is rare in practice and
 // every cached span has the same Content-Length when answering as
 // "headers for the whole object").
-func (h *Handler) serveCachedHead(w http.ResponseWriter, meta *cache.Meta) bool {
+func (h *Handler) serveCachedHead(w http.ResponseWriter, meta *cache.Meta, originExtra map[string]string) bool {
 	telemetry.IncCacheHit()
 	hdr := w.Header()
 	if meta.ContentType != "" {
@@ -583,6 +662,7 @@ func (h *Handler) serveCachedHead(w http.ResponseWriter, meta *cache.Meta) bool 
 		hdr.Set("ETag", meta.ETag)
 	}
 	applyExtraHeaders(hdr, meta.ExtraHeaders)
+	applyExtraHeaders(hdr, originExtra)
 	if meta.Total != nil && *meta.Total >= 0 {
 		hdr.Set("Content-Length", strconv.FormatInt(*meta.Total, 10))
 	}
@@ -710,7 +790,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamHost, 
 			var ok bool
 			unlock, ok = h.store.AcquireRangeCtx(cctx, keyHex, inflightStart, inflightEnd, h.inflightBudget)
 			if !ok {
-				if h.tryServeFromCache(w, rangeHdr, keyHex, false) {
+				if h.tryServeFromCache(w, rangeHdr, keyHex, originPath, false) {
 					return
 				}
 				passthrough = true
@@ -723,7 +803,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamHost, 
 		}
 		// Re-check cache under the in-flight ticket -- another goroutine
 		// may have populated this exact range while we were waiting.
-		if !passthrough && h.tryServeFromCache(w, rangeHdr, keyHex, false) {
+		if !passthrough && h.tryServeFromCache(w, rangeHdr, keyHex, originPath, false) {
 			unlock()
 			return
 		}
@@ -752,6 +832,17 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamHost, 
 	}
 	h.copyAndRewriteHeaders(w.Header(), resp, outboundOrigin)
 
+	// /_p/ body responses (the hop after a rewritten cross-host
+	// redirect) must carry the resolve metadata of the request that
+	// produced them.  The CDN serving the body does not know which
+	// commit a file was resolved at; the cached redirect does.  hub 2.x
+	// follows the redirect chain in one request and requires
+	// X-Repo-Commit on the FINAL response -- without it the download
+	// aborts with LocalEntryNotFoundError (see originResolveHeaders).
+	if originPath != "" && (resp.Status == http.StatusOK || resp.Status == http.StatusPartialContent) {
+		applyExtraHeaders(w.Header(), h.originResolveHeaders(originPath))
+	}
+
 	// Contended pass-through: we could not claim the in-flight range in
 	// time, so stream the upstream response straight to the client WITHOUT
 	// writing the cache (no ticket held).  The concurrent holder remains
@@ -779,8 +870,22 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamHost, 
 	// trip just to re-read the same redirect target.  Caching the
 	// Location once collapses 911 redirect lookups (Qwen-7B at
 	// 16 MiB chunks) into a single upstream hit per file.
-	if meth == http.MethodGet && cache.IsCacheableRedirectStatus(resp.Status) {
-		h.cacheRedirect(cctx, w, resp, keyHex, upstreamHost, path, rawQuery, auth, hdr)
+	//
+	// HEAD 30x responses are cached as well, filed under the GET key:
+	// HEAD lookups already alias to GET keys (ServeHTTP), and hub 2.x
+	// issues HEAD resolves whose /_p/ follows depend on the cached
+	// redirect to replay resolve metadata (originResolveHeaders).
+	if (meth == http.MethodGet || meth == http.MethodHead) && cache.IsCacheableRedirectStatus(resp.Status) {
+		storeKey := keyHex
+		if meth == http.MethodHead {
+			keyQuery := rawQuery
+			if cache.IsContentAddressedHost(upstreamHost) {
+				keyQuery = ""
+			}
+			const keyAuth = ""
+			storeKey = h.keyHexC.Get(http.MethodGet, upstreamHost, path, keyQuery, keyAuth)
+		}
+		h.cacheRedirect(cctx, w, resp, storeKey, upstreamHost, path, rawQuery, auth, hdr)
 		if unlock != nil {
 			unlock()
 		}
@@ -924,6 +1029,13 @@ func (h *Handler) streamCacheable(w http.ResponseWriter, resp *upstream.Response
 }
 
 func (h *Handler) streamCacheable200(w http.ResponseWriter, resp *upstream.Response, keyHex, upstreamHost, path, rawQuery, auth string, unlock func(), artifact bool, originPath string) {
+	// Persist the origin resolve's preserved headers alongside the
+	// body's own so warm serves replay them straight from this entry
+	// without a redirect-meta lookup (see originResolveHeaders).
+	extra := pickPreservedHeaders(resp.Header)
+	if originPath != "" {
+		extra = mergePreservedHeaders(extra, h.originResolveHeaders(originPath))
+	}
 	params := cache.SegmentParams{
 		Status:       200,
 		UpstreamHost: upstreamHost,
@@ -934,7 +1046,7 @@ func (h *Handler) streamCacheable200(w http.ResponseWriter, resp *upstream.Respo
 		Start:        0,
 		Length:       resp.ContentLength, // -1 if chunked
 		Total:        resp.ContentLength,
-		ExtraHeaders: pickPreservedHeaders(resp.Header),
+		ExtraHeaders: extra,
 		OriginPath:   originPath,
 	}
 	dw, err := h.store.BeginSegment(keyHex, params)
@@ -983,6 +1095,12 @@ func (h *Handler) streamCacheable206(w http.ResponseWriter, resp *upstream.Respo
 		}
 		return
 	}
+	// Same merge as streamCacheable200: keep the origin resolve's
+	// preserved headers on this range entry so warm serves carry them.
+	extra := pickPreservedHeaders(resp.Header)
+	if originPath != "" {
+		extra = mergePreservedHeaders(extra, h.originResolveHeaders(originPath))
+	}
 	params := cache.SegmentParams{
 		Status:       206,
 		UpstreamHost: upstreamHost,
@@ -993,7 +1111,7 @@ func (h *Handler) streamCacheable206(w http.ResponseWriter, resp *upstream.Respo
 		Start:        start,
 		Length:       end - start,
 		Total:        total, // may be -1 for "*"
-		ExtraHeaders: pickPreservedHeaders(resp.Header),
+		ExtraHeaders: extra,
 		OriginPath:   originPath,
 	}
 	dw, err := h.store.BeginSegment(keyHex, params)
