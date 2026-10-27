@@ -128,22 +128,27 @@ func applyExtraHeaders(dst http.Header, extra map[string]string) {
 	}
 }
 
-// mergePreservedHeaders merges a fallback header set (the origin
-// resolve redirect's preserved headers) into a body response's own
-// preserved set.  Values already present in `own` win: they came from
-// the host that actually served the body.
-func mergePreservedHeaders(own, fallback map[string]string) map[string]string {
-	if len(fallback) == 0 {
+// mergePreservedHeaders merges the origin resolve redirect's preserved
+// headers (the authoritative resolve metadata) into a body response's
+// own preserved set.  `authoritative` wins on conflict: it is the
+// /resolve/ response that hub validates against (hub 1.x reads these
+// headers on the redirect itself; hub 2.x reads them off the final body
+// response but expects the same values), so the redirect's values are
+// authoritative wherever both sides carry a key.  This matches the
+// serve-side precedence: forward and tryServeFromCache both apply the
+// origin redirect's headers last.
+func mergePreservedHeaders(own, authoritative map[string]string) map[string]string {
+	if len(authoritative) == 0 {
 		return own
 	}
-	out := make(map[string]string, len(own)+len(fallback))
-	for k, v := range fallback {
+	out := make(map[string]string, len(own)+len(authoritative))
+	for k, v := range own {
+		out[k] = v
+	}
+	for k, v := range authoritative {
 		if v != "" {
 			out[k] = v
 		}
-	}
-	for k, v := range own {
-		out[k] = v
 	}
 	return out
 }
