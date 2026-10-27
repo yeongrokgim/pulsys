@@ -865,8 +865,12 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamHost, 
 	// follows the redirect chain in one request and requires
 	// X-Repo-Commit on the FINAL response -- without it the download
 	// aborts with LocalEntryNotFoundError (see originResolveHeaders).
+	// Loaded ONCE here and threaded into streamCacheable so the
+	// persist-time merge does not re-read the redirect meta from disk.
+	var originExtra map[string]string
 	if originPath != "" && (resp.Status == http.StatusOK || resp.Status == http.StatusPartialContent) {
-		applyExtraHeaders(w.Header(), h.originResolveHeaders(originPath))
+		originExtra = h.originResolveHeaders(originPath)
+		applyExtraHeaders(w.Header(), originExtra)
 	}
 
 	// Contended pass-through: we could not claim the in-flight range in
@@ -886,7 +890,7 @@ func (h *Handler) forward(w http.ResponseWriter, r *http.Request, upstreamHost, 
 	// first metadata round-trip blocks the entire download chain.
 	auth := r.Header.Get("Authorization")
 	if meth == http.MethodGet && (resp.Status == http.StatusOK || resp.Status == http.StatusPartialContent) {
-		h.streamCacheable(w, resp, keyHex, upstreamHost, path, rawQuery, auth, unlock, artifact, originPath)
+		h.streamCacheable(w, resp, keyHex, upstreamHost, path, rawQuery, auth, unlock, artifact, originPath, originExtra)
 		return
 	}
 
@@ -1036,12 +1040,12 @@ func (h *Handler) cacheableLocation(ctx context.Context, resp *upstream.Response
 // happy 200 / 206 GET cases.  `artifact` controls only which telemetry
 // counter is incremented; the on-disk layout is identical so a warm
 // hit serves the cached entry regardless of original classification.
-func (h *Handler) streamCacheable(w http.ResponseWriter, resp *upstream.Response, keyHex, upstreamHost, path, rawQuery, auth string, unlock func(), artifact bool, originPath string) {
+func (h *Handler) streamCacheable(w http.ResponseWriter, resp *upstream.Response, keyHex, upstreamHost, path, rawQuery, auth string, unlock func(), artifact bool, originPath string, originExtra map[string]string) {
 	switch resp.Status {
 	case http.StatusOK:
-		h.streamCacheable200(w, resp, keyHex, upstreamHost, path, rawQuery, auth, unlock, artifact, originPath)
+		h.streamCacheable200(w, resp, keyHex, upstreamHost, path, rawQuery, auth, unlock, artifact, originPath, originExtra)
 	case http.StatusPartialContent:
-		h.streamCacheable206(w, resp, keyHex, upstreamHost, path, rawQuery, auth, unlock, artifact, originPath)
+		h.streamCacheable206(w, resp, keyHex, upstreamHost, path, rawQuery, auth, unlock, artifact, originPath, originExtra)
 	default:
 		// Defense in depth: caller should have filtered, but if we get
 		// here just stream-through without recording bytes.
@@ -1052,13 +1056,14 @@ func (h *Handler) streamCacheable(w http.ResponseWriter, resp *upstream.Response
 	}
 }
 
-func (h *Handler) streamCacheable200(w http.ResponseWriter, resp *upstream.Response, keyHex, upstreamHost, path, rawQuery, auth string, unlock func(), artifact bool, originPath string) {
-	// Persist the origin resolve's preserved headers alongside the
-	// body's own so warm serves replay them straight from this entry
-	// without a redirect-meta lookup (see originResolveHeaders).
+func (h *Handler) streamCacheable200(w http.ResponseWriter, resp *upstream.Response, keyHex, upstreamHost, path, rawQuery, auth string, unlock func(), artifact bool, originPath string, originExtra map[string]string) {
+	// Persist the origin resolve's preserved headers (loaded once by
+	// forward) alongside the body's own so warm serves replay them
+	// straight from this entry without a redirect-meta lookup (see
+	// originResolveHeaders).
 	extra := pickPreservedHeaders(resp.Header)
 	if originPath != "" {
-		extra = mergePreservedHeaders(extra, h.originResolveHeaders(originPath))
+		extra = mergePreservedHeaders(extra, originExtra)
 	}
 	params := cache.SegmentParams{
 		Status:       200,
@@ -1109,7 +1114,7 @@ func (h *Handler) streamCacheable200(w http.ResponseWriter, resp *upstream.Respo
 	telemetry.AddClientBytesServed(written)
 }
 
-func (h *Handler) streamCacheable206(w http.ResponseWriter, resp *upstream.Response, keyHex, upstreamHost, path, rawQuery, auth string, unlock func(), artifact bool, originPath string) {
+func (h *Handler) streamCacheable206(w http.ResponseWriter, resp *upstream.Response, keyHex, upstreamHost, path, rawQuery, auth string, unlock func(), artifact bool, originPath string, originExtra map[string]string) {
 	start, end, total, ok := parseContentRangeResponse(resp.Header.Get("Content-Range"))
 	if !ok {
 		// Unknown Content-Range -- fall through to streaming pass-through.
@@ -1120,10 +1125,11 @@ func (h *Handler) streamCacheable206(w http.ResponseWriter, resp *upstream.Respo
 		return
 	}
 	// Same merge as streamCacheable200: keep the origin resolve's
-	// preserved headers on this range entry so warm serves carry them.
+	// preserved headers (loaded once by forward) on this range entry so
+	// warm serves carry them.
 	extra := pickPreservedHeaders(resp.Header)
 	if originPath != "" {
-		extra = mergePreservedHeaders(extra, h.originResolveHeaders(originPath))
+		extra = mergePreservedHeaders(extra, originExtra)
 	}
 	params := cache.SegmentParams{
 		Status:       206,
