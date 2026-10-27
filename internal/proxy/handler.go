@@ -206,6 +206,10 @@ func (h *Handler) cacheKey(method, host, path, rawQuery string) string {
 // /resolve/<sha>/<file> key may instead be an alias written by
 // maybeWriteRevAlias pointing at the /resolve/main/<file> canonical
 // slot, so we follow AliasOf one hop.
+//
+// A miss is logged at debug level (with a reason) so a hub 2.x download
+// failing with "missing the 'X-Repo-Commit' header" leaves a
+// proxy-side breadcrumb naming the origin we tried to look up.
 func (h *Handler) originResolveHeaders(originPath string) map[string]string {
 	if originPath == "" {
 		return nil
@@ -214,16 +218,20 @@ func (h *Handler) originResolveHeaders(originPath string) map[string]string {
 	key := h.cacheKey(http.MethodGet, host, originPath, "")
 	meta, err := h.store.LoadMeta(key)
 	if err != nil || meta == nil {
+		h.log.Debug("origin resolve metadata miss", "origin", originPath, "reason", "no-cached-redirect")
 		return nil
 	}
 	if meta.AliasOf != "" {
 		canonical, err := h.store.LoadMeta(meta.AliasOf)
 		if err != nil || canonical == nil {
+			h.log.Debug("origin resolve metadata miss", "origin", originPath, "reason", "alias-target-missing")
 			return nil
 		}
 		meta = canonical
 	}
 	if !cache.IsCacheableRedirectStatus(meta.StatusCode) {
+		h.log.Debug("origin resolve metadata miss",
+			"origin", originPath, "reason", "origin-entry-not-redirect", "status", meta.StatusCode)
 		return nil
 	}
 	return meta.ExtraHeaders
